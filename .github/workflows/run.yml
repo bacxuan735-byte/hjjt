@@ -1,37 +1,12 @@
-name: RDP + Tailscale + RustDesk
+name: RDP + Tailscale + RustDesk + (Optional) Chrome Remote Desktop (A)
 
 on:
   workflow_dispatch:
     inputs:
-      ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
-        required: true
-      ts_api_key:
-        description: "Tailscale API key (device admin, no Bearer)"
-        required: true
-      ts_authkey:
-        description: "Tailscale Auth key (reusable or ephemeral)"
-        required: true
-      quick_test:
-        description: "Run 5-minute test"
-        type: boolean
-        default: false
-      runtime_minutes:
-        description: "Runtime (max 360; default 355 when not test)"
-        required: false
-        default: "355"
-      do_purge:
-        description: "Purge bullet* devices at start (single instance only)"
-        required: false
-        default: "true"
-      cycles:
-        description: "0=stop after A; N=handoffs left incl this run"
-        required: false
-        default: "0"
-      rdp_count:
-        description: "How many RDP instances (1-10)"
-        required: false
-        default: "1"
+      ts_tailnet: { description: "Tailscale tailnet", required: true }
+      ts_api_key: { description: "Tailscale API key", required: true }
+      ts_authkey: { description: "Tailscale Auth key", required: true }
+      runtime_minutes: { description: "Runtime (max 360)", default: "360" }
 
 permissions:
   contents: read
@@ -42,52 +17,69 @@ defaults:
     shell: pwsh
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.mk.outputs.matrix }}
-    steps:
-      - id: mk
-        run: |
-          $n = [int]"${{ inputs.rdp_count }}"
-          if ($n -lt 1) { $n = 1 }
-          if ($n -gt 10) { $n = 10 }
-
-          $inc = @()
-          for ($i=1; $i -le $n; $i++) { $inc += @{ id = $i } }
-          $json = @{ include = $inc } | ConvertTo-Json -Compress
-          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
-
   rdp:
-    needs: setup
     runs-on: windows-latest
-    strategy:
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-      max-parallel: 10
     timeout-minutes: 370
     env:
       RDP_USER: Bullettemporary
       RDP_PASS: Bullet@12345
 
     steps:
-      - name: Checkout repository (nếu cần)
-        uses: actions/checkout@v4
-
-      # Các bước tiếp theo của bạn ở đây:
-      # - Cài Tailscale
-      # - Cài RustDesk
-      # - Enable RDP
-      # - Setup autologin, firewall, v.v.
-      # (giữ nguyên các bước cũ của bạn, chỉ bỏ phần CRD)
-
-      # Ví dụ placeholder các bước phổ biến:
-      - name: Enable RDP
+      - name: Enable RDP user + firewall
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      # ... các bước Tailscale, RustDesk còn lại của bạn
-
-      - name: Keep alive & shutdown timer
+      # ================== 🔥 GỘP TỐI ƯU Ở ĐÂY 🔥 ==================
+      - name: AUTO OPTIMIZE – RDP + AUDIO NEVER OFF (6H SAFE)
+        shell: cmd
         run: |
-          # Code giữ máy chạy đến hết runtime_minutes như cũ
+          powercfg -x -monitor-timeout-ac 0
+          powercfg -x -disk-timeout-ac 0
+          powercfg -x -standby-timeout-ac 0
+          powercfg -x -hibernate-timeout-ac 0
+
+          for /f "tokens=3" %%a in ('powercfg -l ^| find "High performance"') do powercfg -setactive %%a
+
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server" /v fSingleSessionPerUser /t REG_DWORD /d 0 /f
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v IdleTimeout /t REG_DWORD /d 0 /f
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" /v MaxDisconnectionTime /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxIdleTime /t REG_DWORD /d 0 /f
+          reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" /v MaxDisconnectionTime /t REG_DWORD /d 0 /f
+
+          sc config Audiosrv start= auto
+          sc config AudioEndpointBuilder start= auto
+          net start Audiosrv
+          net start AudioEndpointBuilder
+
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Audio" /v DisableProtectedAudioDG /t REG_DWORD /d 1 /f
+          reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" /v InactivityTimeoutSecs /t REG_DWORD /d 0 /f
+
+          schtasks /create /sc minute /mo 1 /tn "KeepAlive" /tr "cmd /c exit" /ru SYSTEM /f
+
+          echo OPTIMIZE DONE
+      # ============================================================
+
+      - name: Install + Up Tailscale
+        run: |
+          $ts="$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi -OutFile ts.msi
+            Start-Process msiexec.exe -ArgumentList "/i ts.msi /quiet /norestart" -Wait
+          }
+          & $ts up --authkey "${{ inputs.ts_authkey }}"
+
+      - name: Keep alive
+        run: |
+          $end=(Get-Date).AddMinutes([int]"${{ inputs.runtime_minutes }}")
+          while((Get-Date) -lt $end){
+            Write-Host "Alive $(Get-Date)"
+            Start-Sleep 60
+          }
